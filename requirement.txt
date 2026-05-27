@@ -1,0 +1,10 @@
+flask
+flask-cors
+pymupdf
+python-docx
+pandas
+requests
+gunicorn
+supabase
+cohere
+python-dotenv
