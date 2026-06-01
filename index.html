@@ -539,6 +539,18 @@
   function autoResize(el) { el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 100) + 'px'; }
   function handleEnter(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendQuestion(); } }
 
+  async function fetchWithRetry(url, options, retries = 3) {
+    for (var i = 0; i < retries; i++) {
+        try {
+            var res = await fetch(url, options);
+            if (res.ok) return res;
+        } catch(err) {
+            if (i === retries - 1) throw err;
+            await new Promise(r => setTimeout(r, 2000));
+        }
+    }
+ }
+
   async function sendQuestion() {
     if (busy || !activeProject) return;
 
@@ -555,17 +567,17 @@
     showTyping();
 
     try {
-      var res = await fetch(BACKEND_URL + '/ask', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          question: q,
-          project_id: activeProject.id,
-          project_name: activeProject.name,
-          project_desc: activeProject.description || '',
-          file_name: selectedFile === 'all' ? null : selectedFile,
-          history: chatHistory.slice(0, -1)
-        })
+      var res = await fetchWithRetry(BACKEND_URL + '/ask', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+      question: q,
+      project_id: activeProject.id,
+      project_name: activeProject.name,
+      project_desc: activeProject.description || '',
+      file_name: selectedFile === 'all' ? null : selectedFile,
+      history: chatHistory.slice(0, -1)
+      })
       });
 
       var data = await res.json();

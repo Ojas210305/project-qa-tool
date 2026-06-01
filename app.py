@@ -221,7 +221,6 @@ def ask():
     if not question:
         return jsonify({"error": "No question provided"}), 400
 
-    # Generate query embedding using Cohere on backend
     query_embedding = get_embedding(question, input_type="search_query")
     if not query_embedding:
         return jsonify({"error": "Could not generate embedding for question"}), 500
