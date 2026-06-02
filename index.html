@@ -182,12 +182,15 @@
   </div>
   <div id="qa-active" style="display:none;">
     <div class="qa-top">
-      <div>
+    <div>
         <h3 id="qaProjectName">—</h3>
         <p id="qaProjectSub">—</p>
-      </div>
-      <button class="btn btn-outline" onclick="goto('select')">Change Project</button>
     </div>
+    <div style="display:flex;gap:8px;">
+        <button class="btn btn-outline" onclick="clearChat()">New Chat</button>
+        <button class="btn btn-outline" onclick="goto('select')">Change Project</button>
+    </div>
+</div>
     <div class="qa-layout">
       <div class="file-sidebar">
         <h4>📁 Files</h4>
@@ -238,7 +241,7 @@
     if (page === 'qa')     btns[2].classList.add('active');
     if (page === 'select') loadProjects();
     if (page === 'admin')  loadProjectsAdmin();
-    if (page === 'qa')     loadQA();
+    if (page === 'qa')     loadQA().catch(console.error);
   }
 
   async function loadProjects() {
@@ -464,16 +467,24 @@
   }
 
   async function pickProject(projectId) {
+    if (!projects.length) {
+        await loadProjects();
+    }
     activeProject = projects.find(function(p) { return p.id === projectId; });
+    if (!activeProject) return;
+    localStorage.setItem('activeProjectId', projectId);
     chatHistory = [];
     selectedFile = 'all';
     activeFiles = await getProjectFiles(projectId);
     renderGrid();
-    showToast('Project selected');
-    setTimeout(function() { goto('qa'); }, 500);
+    document.querySelectorAll('.page').forEach(function(p) { p.classList.remove('active'); });
+    document.querySelectorAll('nav button').forEach(function(b) { b.classList.remove('active'); });
+    document.getElementById('page-qa').classList.add('active');
+    document.querySelectorAll('nav button')[2].classList.add('active');
+    await loadQA();
   }
 
-  function loadQA() {
+  async function loadQA() {
     if (!activeProject) {
       document.getElementById('no-project').style.display = 'block';
       document.getElementById('qa-active').style.display = 'none';
@@ -484,11 +495,34 @@
     document.getElementById('qaProjectName').innerText = activeProject.name;
     document.getElementById('qaProjectSub').innerText = activeFiles.length + ' document(s) loaded';
     renderFileSidebar();
-    if (!chatHistory.length) {
-      document.getElementById('chatMessages').innerHTML = '';
-      addMsg('ai', 'Hi! Project <strong>' + activeProject.name + '</strong> is loaded.<br><br>' +
-        'Using neural search — only the most relevant sections are used to answer your questions.<br><br>' +
-        'You can ask about all files or click a specific file on the left to focus on it.');
+
+    try {
+        var res = await fetch(BACKEND_URL + '/get_history', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ project_id: activeProject.id })
+        });
+        var data = await res.json();
+
+        if (data.history && data.history.length > 0) {
+            document.getElementById('chatMessages').innerHTML = '';
+            chatHistory = [];
+            data.history.forEach(function(msg) {
+                var html = msg.content
+                    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+                    .replace(/\n/g,'<br>');
+                addMsg(msg.role === 'user' ? 'user' : 'ai', html);
+                chatHistory.push({ role: msg.role, content: msg.content });
+            });
+        } else {
+            document.getElementById('chatMessages').innerHTML = '';
+            addMsg('ai', 'Hi! Project <strong>' + activeProject.name +
+                '</strong> is loaded. Ask me anything!');
+        }
+    } catch(err) {
+        document.getElementById('chatMessages').innerHTML = '';
+        addMsg('ai', 'Hi! Project <strong>' + activeProject.name +
+            '</strong> is loaded. Ask me anything!');
     }
   }
 
@@ -568,16 +602,16 @@
 
     try {
       var res = await fetchWithRetry(BACKEND_URL + '/ask', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-      question: q,
-      project_id: activeProject.id,
-      project_name: activeProject.name,
-      project_desc: activeProject.description || '',
-      file_name: selectedFile === 'all' ? null : selectedFile,
-      history: chatHistory.slice(0, -1)
-      })
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          question: q,
+          project_id: activeProject.id,
+          project_name: activeProject.name,
+          project_desc: activeProject.description || '',
+          file_name: selectedFile === 'all' ? null : selectedFile,
+          history: chatHistory.slice(0, -1)
+        })
       });
 
       var data = await res.json();
@@ -591,6 +625,26 @@
           .replace(/\n/g,'<br>').replace(/\*\*(.*?)\*\*/g,'<strong>$1</strong>');
         addMsg('ai', html);
         chatHistory.push({ role: 'assistant', content: data.reply });
+
+        await fetch(BACKEND_URL + '/save_message', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            project_id: activeProject.id,
+            role: 'user',
+            content: q
+          })
+        });
+
+        await fetch(BACKEND_URL + '/save_message', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            project_id: activeProject.id,
+            role: 'assistant',
+            content: data.reply
+          })
+        });
       }
     } catch(err) {
       hideTyping();
@@ -607,7 +661,12 @@
     setTimeout(function() { t.classList.remove('show'); }, 2500);
   }
 
-  loadProjects();
+  loadProjects().then(async function() {
+    var savedId = localStorage.getItem('activeProjectId');
+    if (savedId) {
+        await pickProject(savedId);
+    }
+});
 </script>
 </body>
 </html>
