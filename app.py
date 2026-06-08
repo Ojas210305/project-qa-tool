@@ -293,17 +293,29 @@ Instructions:
             "https://openrouter.ai/api/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {OPENROUTER_KEY}",
-                "Content-Type":  "application/json"
+                "Content-Type":  "application/json",
+                "HTTP-Referer":  "http://localhost:5000",
+                "X-Title":       "Project QA Tool"
             },
             json={
-                "model":      "openrouter/free",
+                "model":      "openrouter/auto",
                 "messages":   messages,
                 "max_tokens": 1000
-            }
+            },
+            timeout=30
         )
         result = response.json()
+        print(f"OpenRouter status: {response.status_code}")
+        print(f"OpenRouter response: {result}")
+
         if "error" in result:
-            return jsonify({"error": result["error"]["message"]}), 500
+            error_msg = result["error"] if isinstance(result["error"], str) else result["error"].get("message", str(result["error"]))
+            print(f"OpenRouter error: {error_msg}")
+            return jsonify({"error": error_msg}), 500
+
+        if "choices" not in result or not result["choices"]:
+            print(f"No choices in response: {result}")
+            return jsonify({"error": "No response from AI model. Try again."}), 500
 
         reply = result["choices"][0]["message"]["content"]
 
@@ -315,6 +327,7 @@ Instructions:
         return jsonify({"reply": reply, "tokens_used": tokens_used})
 
     except Exception as e:
+        print(f"OpenRouter exception: {e}")
         return jsonify({"error": str(e)}), 500
 
 
