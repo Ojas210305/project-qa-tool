@@ -101,6 +101,7 @@
     .msg-bubble { max-width: 75%; padding: 9px 13px; border-radius: 6px; font-size: 14px; line-height: 1.6; }
     .msg.user .msg-bubble { background: #333; color: #fff; }
     .msg.ai .msg-bubble { background: #f4f4f4; color: #333; border: 1px solid #e8e8e8; }
+    .token-badge { font-size: 10px; color: #aaa; margin-top: 3px; text-align: right; }
 
     .chat-input-row { border-top: 1px solid #ddd; padding: 10px 14px; display: flex; gap: 8px; background: #fafafa; align-items: flex-end; }
     .chat-input-row textarea { flex: 1; min-height: 38px; max-height: 100px; resize: none; font-size: 14px; padding: 8px 10px; border: 1px solid #ccc; border-radius: 4px; background: #fff; font-family: Arial, sans-serif; outline: none; }
@@ -111,6 +112,13 @@
 
     .context-bar { padding: 6px 14px; background: #f9f9f9; border-bottom: 1px solid #eee; font-size: 12px; color: #888; }
     .context-bar span { color: #333; font-weight: bold; }
+
+    /* TOKEN USAGE TABLE */
+    .token-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 10px; }
+    .token-table th { background: #f4f4f4; padding: 8px 10px; text-align: left; border-bottom: 2px solid #ddd; font-weight: bold; color: #555; }
+    .token-table td { padding: 7px 10px; border-bottom: 1px solid #eee; color: #444; }
+    .token-table tr:hover td { background: #fafafa; }
+    .total-tokens { font-size: 13px; color: #555; margin-top: 8px; font-weight: bold; }
 
     .empty { text-align: center; padding: 40px; color: #bbb; font-size: 14px; }
     .no-project { text-align: center; padding: 60px 20px; color: #bbb; }
@@ -182,15 +190,15 @@
   </div>
   <div id="qa-active" style="display:none;">
     <div class="qa-top">
-    <div>
+      <div>
         <h3 id="qaProjectName">—</h3>
         <p id="qaProjectSub">—</p>
-    </div>
-    <div style="display:flex;gap:8px;">
-        <button class="btn btn-outline" onclick="clearChat()">New Chat</button>
+      </div>
+      <div style="display:flex;gap:8px;">
+        <button class="btn btn-outline" onclick="startNewChat()">New Chat</button>
         <button class="btn btn-outline" onclick="goto('select')">Change Project</button>
+      </div>
     </div>
-</div>
     <div class="qa-layout">
       <div class="file-sidebar">
         <h4>📁 Files</h4>
@@ -216,7 +224,7 @@
 <input type="file" id="addFileInput" multiple accept=".txt,.pdf,.docx,.csv,.md">
 
 <script>
-  var BACKEND_URL = "http://localhost:5000";
+  var BACKEND_URL = "http://localhost:5000";;
   var activeProject = null;
   var activeFiles = [];
   var selectedFile = 'all';
@@ -226,6 +234,7 @@
   var projects = [];
   var addingFilesToProjectId = null;
   var pendingAddFiles = [];
+  var currentSessionId = null;
 
   function adminLogin() {
     goto('admin');
@@ -241,7 +250,14 @@
     if (page === 'qa')     btns[2].classList.add('active');
     if (page === 'select') loadProjects();
     if (page === 'admin')  loadProjectsAdmin();
-    if (page === 'qa')     loadQA().catch(console.error);
+  }
+
+  function generateUUID() {
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+      var r = Math.random() * 16 | 0;
+      var v = c === 'x' ? r : (r & 0x3 | 0x8);
+      return v.toString(16);
+    });
   }
 
   async function loadProjects() {
@@ -260,6 +276,7 @@
     renderAdminList();
   }
 
+
   async function createProject() {
     var name = document.getElementById('projName').value.trim();
     var desc = document.getElementById('projDesc').value.trim();
@@ -270,7 +287,6 @@
     showToast('Creating project...');
 
     try {
-      // Step 1: Create project
       var res = await fetch(BACKEND_URL + '/create_project', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -280,7 +296,6 @@
       if (data.error) { showToast('Error: ' + data.error); document.getElementById('uploadingMsg').style.display = 'none'; return; }
       var project = data.project;
 
-      // Step 2: Upload files - backend handles chunking and Cohere embeddings
       showToast('Processing files with AI embeddings...');
       var formData = new FormData();
       selectedFiles.forEach(function(f) { formData.append('files', f); });
@@ -467,12 +482,13 @@
   }
 
   async function pickProject(projectId) {
-    if (!projects.length) {
-        await loadProjects();
-    }
+    if (!projects.length) await loadProjects();
     activeProject = projects.find(function(p) { return p.id === projectId; });
     if (!activeProject) return;
     localStorage.setItem('activeProjectId', projectId);
+    var savedSession = localStorage.getItem('sessionId_' + projectId);
+    currentSessionId = savedSession || generateUUID();
+    localStorage.setItem('sessionId_' + projectId, currentSessionId);
     chatHistory = [];
     selectedFile = 'all';
     activeFiles = await getProjectFiles(projectId);
@@ -482,6 +498,30 @@
     document.getElementById('page-qa').classList.add('active');
     document.querySelectorAll('nav button')[2].classList.add('active');
     await loadQA();
+  }
+
+  async function startNewChat() {
+    if (!activeProject) return;
+    if (!confirm('Start a new chat? Previous history will be kept but archived.')) return;
+
+    try {
+      var res = await fetch(BACKEND_URL + '/new_chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_id: activeProject.id })
+      });
+      var data = await res.json();
+      if (data.session_id) {
+        currentSessionId = data.session_id;
+        localStorage.setItem('sessionId_' + activeProject.id, currentSessionId);
+      }
+      chatHistory = [];
+      document.getElementById('chatMessages').innerHTML = '';
+      addMsg('ai', 'New chat started! Ask me anything about <strong>' + activeProject.name + '</strong>.');
+      showToast('New chat started!');
+    } catch(err) {
+      showToast('Could not start new chat');
+    }
   }
 
   async function loadQA() {
@@ -497,32 +537,30 @@
     renderFileSidebar();
 
     try {
-        var res = await fetch(BACKEND_URL + '/get_history', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ project_id: activeProject.id })
-        });
-        var data = await res.json();
+      var res = await fetch(BACKEND_URL + '/get_history', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_id: activeProject.id, session_id: currentSessionId })
+      });
+      var data = await res.json();
 
-        if (data.history && data.history.length > 0) {
-            document.getElementById('chatMessages').innerHTML = '';
-            chatHistory = [];
-            data.history.forEach(function(msg) {
-                var html = msg.content
-                    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-                    .replace(/\n/g,'<br>');
-                addMsg(msg.role === 'user' ? 'user' : 'ai', html);
-                chatHistory.push({ role: msg.role, content: msg.content });
-            });
-        } else {
-            document.getElementById('chatMessages').innerHTML = '';
-            addMsg('ai', 'Hi! Project <strong>' + activeProject.name +
-                '</strong> is loaded. Ask me anything!');
-        }
-    } catch(err) {
+      if (data.history && data.history.length > 0) {
         document.getElementById('chatMessages').innerHTML = '';
-        addMsg('ai', 'Hi! Project <strong>' + activeProject.name +
-            '</strong> is loaded. Ask me anything!');
+        chatHistory = [];
+        data.history.forEach(function(msg) {
+          var html = msg.content
+            .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+            .replace(/\n/g,'<br>');
+          addMsg(msg.role === 'user' ? 'user' : 'ai', html);
+          chatHistory.push({ role: msg.role, content: msg.content });
+        });
+      } else {
+        document.getElementById('chatMessages').innerHTML = '';
+        addMsg('ai', 'Hi! Project <strong>' + activeProject.name + '</strong> is loaded. Ask me anything!');
+      }
+    } catch(err) {
+      document.getElementById('chatMessages').innerHTML = '';
+      addMsg('ai', 'Hi! Project <strong>' + activeProject.name + '</strong> is loaded. Ask me anything!');
     }
   }
 
@@ -552,14 +590,15 @@
     }
   }
 
-  function addMsg(role, html) {
+    function addMsg(role, html, tokens) {
     var el = document.getElementById('chatMessages');
     var div = document.createElement('div');
     div.className = 'msg ' + role;
-    div.innerHTML = '<div class="msg-avatar">' + (role === 'user' ? 'You' : 'AI') + '</div><div class="msg-bubble">' + html + '</div>';
+    div.innerHTML = '<div class="msg-avatar">' + (role === 'user' ? 'You' : 'AI') + '</div>' +
+      '<div><div class="msg-bubble">' + html + '</div></div>';
     el.appendChild(div);
     el.scrollTop = el.scrollHeight;
-  }
+}
 
   function showTyping() {
     var el = document.getElementById('chatMessages');
@@ -573,17 +612,18 @@
   function autoResize(el) { el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 100) + 'px'; }
   function handleEnter(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendQuestion(); } }
 
-  async function fetchWithRetry(url, options, retries = 3) {
+  async function fetchWithRetry(url, options, retries) {
+    retries = retries || 3;
     for (var i = 0; i < retries; i++) {
-        try {
-            var res = await fetch(url, options);
-            if (res.ok) return res;
-        } catch(err) {
-            if (i === retries - 1) throw err;
-            await new Promise(r => setTimeout(r, 2000));
-        }
+      try {
+        var res = await fetch(url, options);
+        if (res.ok) return res;
+      } catch(err) {
+        if (i === retries - 1) throw err;
+        await new Promise(function(r) { setTimeout(r, 2000); });
+      }
     }
- }
+  }
 
   async function sendQuestion() {
     if (busy || !activeProject) return;
@@ -620,29 +660,36 @@
       if (data.error) {
         addMsg('ai', 'Error: ' + data.error);
       } else {
+        var tokensUsed = data.tokens_used || 0;
         var html = data.reply
           .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
           .replace(/\n/g,'<br>').replace(/\*\*(.*?)\*\*/g,'<strong>$1</strong>');
-        addMsg('ai', html);
+        addMsg('ai', html, tokensUsed);
         chatHistory.push({ role: 'assistant', content: data.reply });
 
-        await fetch(BACKEND_URL + '/save_message', {
+        // Save user message
+        fetch(BACKEND_URL + '/save_message', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             project_id: activeProject.id,
             role: 'user',
-            content: q
+            content: q,
+            session_id: currentSessionId,
+            tokens_used: tokensUsed
           })
         });
 
-        await fetch(BACKEND_URL + '/save_message', {
+        // Save AI response
+        fetch(BACKEND_URL + '/save_message', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             project_id: activeProject.id,
             role: 'assistant',
-            content: data.reply
+            content: data.reply,
+            session_id: currentSessionId,
+            tokens_used: 0
           })
         });
       }
@@ -664,9 +711,9 @@
   loadProjects().then(async function() {
     var savedId = localStorage.getItem('activeProjectId');
     if (savedId) {
-        await pickProject(savedId);
+      await pickProject(savedId);
     }
-});
+  });
 </script>
 </body>
 </html>

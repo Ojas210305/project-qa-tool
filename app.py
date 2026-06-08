@@ -11,56 +11,11 @@ import io
 import os
 import threading
 import time
+import uuid
 from supabase import create_client, Client
 
 app = Flask(__name__)
 CORS(app)
-
-# Enable detailed logging to terminal
-import logging
-import sys
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s %(name)s: %(message)s', stream=sys.stdout)
-app.logger.setLevel(logging.DEBUG)
-# Ensure werkzeug (the HTTP server) prints access logs to stdout at INFO level
-werkzeug_logger = logging.getLogger('werkzeug')
-handler = logging.StreamHandler(sys.stdout)
-handler.setLevel(logging.INFO)
-handler.setFormatter(logging.Formatter('%(message)s'))
-if not any(isinstance(h, logging.StreamHandler) for h in werkzeug_logger.handlers):
-    werkzeug_logger.addHandler(handler)
-werkzeug_logger.setLevel(logging.INFO)
-werkzeug_logger.propagate = False
-
-
-
-@app.before_request
-def log_request_info():
-    try:
-        app.logger.debug("Request: %s %s - args=%s json=%s", request.method, request.path, request.args.to_dict(), request.get_json(silent=True))
-    except Exception:
-        app.logger.exception("Failed to log request data")
-
-
-@app.after_request
-def log_access(response):
-    try:
-        from datetime import datetime
-        now = datetime.utcnow().strftime('%d/%b/%Y %H:%M:%S')
-        addr = request.remote_addr or '-'
-        proto = request.environ.get('SERVER_PROTOCOL', 'HTTP/1.1')
-        line = f"{addr} - - [{now}] \"{request.method} {request.path} {proto}\" {response.status_code} -"
-        # Use werkzeug logger to match expected output placement
-        werkzeug_logger = logging.getLogger('werkzeug')
-        werkzeug_logger.info(line)
-    except Exception:
-        app.logger.exception('Failed to log access line')
-    return response
-
-
-@app.errorhandler(Exception)
-def handle_all_exceptions(e):
-    app.logger.exception("Unhandled exception occurred")
-    return jsonify({"error": str(e)}), 500
 
 OPENROUTER_KEY = os.environ.get("OPENROUTER_KEY", "")
 SUPABASE_URL   = os.environ.get("SUPABASE_URL", "")
@@ -73,7 +28,6 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # ── COHERE EMBEDDING ─────────────────────────────────────────
 
 def get_embedding(text, input_type="search_document"):
-    """Generate embedding using Cohere API - 1024 dimensions"""
     try:
         response = requests.post(
             "https://api.cohere.com/v1/embed",
@@ -192,7 +146,6 @@ def delete_project():
 
 @app.route("/upload", methods=["POST"])
 def upload():
-    """Extract text, chunk, embed with Cohere and store in Supabase"""
     files      = request.files.getlist("files")
     project_id = request.form.get("project_id", "")
 
@@ -251,53 +204,10 @@ def delete_file():
         return jsonify({"success": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-    
-@app.route("/save_message", methods=["POST"])
-def save_message():
-    data = request.json
-    project_id = data.get("project_id")
-    role = data.get("role")
-    content = data.get("content")
-    try:
-        supabase.table("chat_history").insert({
-            "project_id": project_id,
-            "role": role,
-            "content": content
-        }).execute()
-        return jsonify({"success": True})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/get_history", methods=["POST"])
-def get_history():
-    data = request.json
-    project_id = data.get("project_id")
-    try:
-        result = supabase.table("chat_history").select("*")\
-            .eq("project_id", project_id)\
-            .order("created_at")\
-            .execute()
-        return jsonify({"history": result.data})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    
-@app.route("/clear_history", methods=["POST", "OPTIONS"])
-def clear_history():
-    if request.method == "OPTIONS":
-        return jsonify({}), 200
-    data = request.json
-    project_id = data.get("project_id")
-    try:
-        supabase.table("chat_history").delete().eq("project_id", project_id).execute()
-        return jsonify({"success": True})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/ask", methods=["POST"])
 def ask():
-    """Answer question using RAG with Cohere embeddings"""
     data         = request.json
     question     = data.get("question", "")
     project_id   = data.get("project_id", "")
@@ -338,7 +248,7 @@ def ask():
         return jsonify({"error": f"Search error: {str(e)}"}), 500
 
     if not matched_chunks:
-        return jsonify({"reply": "I couldn't find relevant information in the documents for your question."})
+        return jsonify({"reply": "I couldn't find relevant information in the documents for your question.", "tokens_used": 0})
 
     context = ""
     for chunk in matched_chunks:
@@ -394,9 +304,104 @@ Instructions:
         result = response.json()
         if "error" in result:
             return jsonify({"error": result["error"]["message"]}), 500
-        reply = result["choices"][0]["message"]["content"]
-        return jsonify({"reply": reply})
 
+        reply = result["choices"][0]["message"]["content"]
+
+        # Get token usage from OpenRouter response
+        tokens_used = 0
+        if "usage" in result:
+            tokens_used = result["usage"].get("total_tokens", 0)
+
+        return jsonify({"reply": reply, "tokens_used": tokens_used})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ── CHAT HISTORY WITH SESSION SUPPORT ────────────────────────
+
+@app.route("/save_message", methods=["POST", "OPTIONS"])
+def save_message():
+    if request.method == "OPTIONS":
+        return jsonify({}), 200
+    data       = request.json
+    project_id = data.get("project_id")
+    role       = data.get("role")
+    content    = data.get("content")
+    session_id = data.get("session_id")
+    tokens     = data.get("tokens_used", 0)
+    try:
+        supabase.table("chat_history").insert({
+            "project_id": project_id,
+            "role":       role,
+            "content":    content,
+            "session_id": session_id,
+            "is_active":  True,
+            "tokens_used": tokens
+        }).execute()
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/get_history", methods=["POST", "OPTIONS"])
+def get_history():
+    if request.method == "OPTIONS":
+        return jsonify({}), 200
+    data       = request.json
+    project_id = data.get("project_id")
+    session_id = data.get("session_id", None)
+    try:
+        query = supabase.table("chat_history").select("*")\
+            .eq("project_id", project_id)\
+            .eq("is_active", True)
+
+        if session_id:
+            query = query.eq("session_id", session_id)
+
+        result = query.order("created_at").execute()
+        return jsonify({"history": result.data})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/new_chat", methods=["POST", "OPTIONS"])
+def new_chat():
+    """Soft delete - marks old messages as inactive, returns new session ID"""
+    if request.method == "OPTIONS":
+        return jsonify({}), 200
+    data       = request.json
+    project_id = data.get("project_id")
+    try:
+        # Mark all current messages as inactive (soft delete)
+        supabase.table("chat_history")\
+            .update({"is_active": False})\
+            .eq("project_id", project_id)\
+            .eq("is_active", True)\
+            .execute()
+
+        # Generate new session ID
+        new_session_id = str(uuid.uuid4())
+        return jsonify({"success": True, "session_id": new_session_id})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/get_token_usage", methods=["POST", "OPTIONS"])
+def get_token_usage():
+    """Get token usage stats for a project"""
+    if request.method == "OPTIONS":
+        return jsonify({}), 200
+    data       = request.json
+    project_id = data.get("project_id")
+    try:
+        result = supabase.table("chat_history")\
+            .select("role, content, tokens_used, created_at, session_id")\
+            .eq("project_id", project_id)\
+            .eq("role", "user")\
+            .order("created_at", desc=True)\
+            .execute()
+        return jsonify({"usage": result.data})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -418,4 +423,4 @@ if __name__ == "__main__":
     t.daemon = True
     t.start()
     port = int(os.environ.get("PORT", 5000))
-    app.run(debug=True, host="0.0.0.0", port=port)
+    app.run(debug=False, host="0.0.0.0", port=port)
