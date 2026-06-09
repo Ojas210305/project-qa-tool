@@ -36,7 +36,7 @@ def get_embedding(text, input_type="search_document"):
                 "Content-Type": "application/json"
             },
             json={
-                "texts": [text[:512]],
+                "texts": [text[:2000]],  # ~500 tokens, safely within Cohere's 512 token limit
                 "model": "embed-english-v3.0",
                 "input_type": input_type
             }
@@ -84,16 +84,64 @@ def extract_text_from_file(file):
 
 # ── CHUNKING ─────────────────────────────────────────────────
 
+def is_table_row(line):
+    """Detects lines that look like table rows (e.g. '1  101  LIFE INSURANCE  ANIN')"""
+    if not line:
+        return False
+    parts = line.split()
+    if len(parts) >= 4 and any(p.isdigit() for p in parts[:2]):
+        return True
+    return False
+
+
 def chunk_text(text, chunk_size=1000, overlap=100):
-    words = text.split()
+    """
+    Smart chunker that:
+    - Keeps entire tables as one chunk (prevents splitting structured data)
+    - Chunks normal text by word count with overlap
+    """
+    lines = text.split("\n")
     chunks = []
-    start = 0
-    while start < len(words):
-        end = start + chunk_size
-        chunk = " ".join(words[start:end])
-        chunks.append(chunk)
-        start += chunk_size - overlap
-    return chunks
+    current_chunk = []
+    current_size = 0
+    i = 0
+
+    while i < len(lines):
+        line = lines[i].strip()
+
+        # Detect start of a table and collect entire table as one chunk
+        if is_table_row(line):
+            table_lines = []
+            while i < len(lines) and (is_table_row(lines[i].strip()) or lines[i].strip() == ""):
+                table_lines.append(lines[i])
+                i += 1
+            table_chunk = "\n".join(table_lines).strip()
+            if table_chunk:
+                # Save any accumulated content before the table
+                if current_chunk:
+                    chunks.append("\n".join(current_chunk).strip())
+                    current_chunk = []
+                    current_size = 0
+                chunks.append(table_chunk)
+            continue
+
+        # Normal line — add to current chunk
+        word_count = len(line.split())
+        if current_size + word_count > chunk_size and current_chunk:
+            chunks.append("\n".join(current_chunk).strip())
+            # Keep last few lines for overlap context
+            overlap_lines = current_chunk[-3:]
+            current_chunk = overlap_lines
+            current_size = sum(len(l.split()) for l in overlap_lines)
+
+        current_chunk.append(line)
+        current_size += word_count
+        i += 1
+
+    if current_chunk:
+        chunks.append("\n".join(current_chunk).strip())
+
+    return [c for c in chunks if c]
 
 
 # ── ROUTES ───────────────────────────────────────────────────
@@ -300,7 +348,7 @@ Instructions:
             json={
                 "model":      "openrouter/auto",
                 "messages":   messages,
-                "max_tokens": 1000
+                "max_tokens": 2000
             },
             timeout=30
         )
