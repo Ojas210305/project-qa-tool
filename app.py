@@ -53,95 +53,169 @@ def get_embedding(text, input_type="search_document"):
 
 
 # ── TEXT EXTRACTION ──────────────────────────────────────────
+# extract_blocks() returns a list of blocks instead of one flat string.
+# Each block is {"type": "text"|"table", "content": str}.
+# This keeps tables intact end-to-end, even when they span multiple pages,
+# so they never get split apart by the chunker later.
 
-def extract_text_from_file(file):
+def _table_to_text(rows):
+    """Convert a list of table rows (list of cells) into a clean text block."""
+    lines = []
+    for row in rows:
+        cells = [str(c).replace("\n", " ").strip() if c is not None else "" for c in row]
+        lines.append(" | ".join(cells))
+    return "\n".join(lines)
+
+
+def _tables_compatible(a_header, b_header):
+    """Check if two tables likely belong to the same multi-page table (same column count)."""
+    return len(a_header) == len(b_header) and len(a_header) > 0
+
+
+def extract_blocks_from_pdf(file_bytes):
+    pdf = fitz.open(stream=file_bytes, filetype="pdf")
+    blocks = []
+    pending_table = None  # holds {"header": [...], "rows": [...]} across pages
+
+    for page in pdf:
+        tabs = page.find_tables()
+        table_bboxes = [fitz.Rect(t.bbox) for t in tabs.tables]
+
+        # Get text only from regions NOT covered by a detected table,
+        # so table content isn't duplicated as plain text.
+        if table_bboxes:
+            page_rect = page.rect
+            text_clips = []
+            # Above the first table
+            text_clips.append(fitz.Rect(page_rect.x0, page_rect.y0, page_rect.x1, table_bboxes[0].y0))
+            # Between tables
+            for j in range(len(table_bboxes) - 1):
+                text_clips.append(fitz.Rect(page_rect.x0, table_bboxes[j].y1, page_rect.x1, table_bboxes[j + 1].y0))
+            # Below the last table
+            text_clips.append(fitz.Rect(page_rect.x0, table_bboxes[-1].y1, page_rect.x1, page_rect.y1))
+
+            page_text = ""
+            for clip in text_clips:
+                if clip.height > 2:  # skip degenerate/empty slivers
+                    page_text += page.get_text(clip=clip)
+        else:
+            page_text = page.get_text()
+
+        if tabs.tables:
+            for t in tabs.tables:
+                data = t.extract()
+                if not data:
+                    continue
+                header, rows = data[0], data[1:]
+
+                if pending_table and _tables_compatible(pending_table["header"], header):
+                    # Looks like a continuation of the previous page's table
+                    pending_table["rows"].extend(rows if rows else [header])
+                else:
+                    # Flush previous pending table as its own block
+                    if pending_table:
+                        full_rows = [pending_table["header"]] + pending_table["rows"]
+                        blocks.append({"type": "table", "content": _table_to_text(full_rows)})
+                    pending_table = {"header": header, "rows": rows}
+        else:
+            # No table on this page — flush any pending table first
+            if pending_table:
+                full_rows = [pending_table["header"]] + pending_table["rows"]
+                blocks.append({"type": "table", "content": _table_to_text(full_rows)})
+                pending_table = None
+
+        if page_text.strip():
+            blocks.append({"type": "text", "content": page_text.strip()})
+
+    if pending_table:
+        full_rows = [pending_table["header"]] + pending_table["rows"]
+        blocks.append({"type": "table", "content": _table_to_text(full_rows)})
+
+    pdf.close()
+    return blocks
+
+
+def extract_blocks_from_file(file):
+    """Returns a list of {"type": "text"|"table", "content": str} blocks for any supported file."""
     filename = file.filename.lower()
-    content = ""
     try:
         if filename.endswith(".txt") or filename.endswith(".md"):
             content = file.read().decode("utf-8", errors="ignore")
+            return [{"type": "text", "content": content.strip()}] if content.strip() else []
+
         elif filename.endswith(".pdf"):
             file_bytes = file.read()
-            pdf = fitz.open(stream=file_bytes, filetype="pdf")
-            for page in pdf:
-                content += page.get_text()
-            pdf.close()
+            return extract_blocks_from_pdf(file_bytes)
+
         elif filename.endswith(".docx"):
             file_bytes = file.read()
             doc = docx.Document(io.BytesIO(file_bytes))
-            for para in doc.paragraphs:
-                content += para.text + "\n"
+            content = "\n".join(para.text for para in doc.paragraphs)
+            return [{"type": "text", "content": content.strip()}] if content.strip() else []
+
         elif filename.endswith(".csv"):
             file_bytes = file.read()
             df = pd.read_csv(io.BytesIO(file_bytes))
             content = df.to_string(index=False)
+            return [{"type": "table", "content": content.strip()}] if content.strip() else []
+
         else:
             content = file.read().decode("utf-8", errors="ignore")
+            return [{"type": "text", "content": content.strip()}] if content.strip() else []
+
     except Exception as e:
-        content = f"Could not read file: {str(e)}"
-    return content.strip()
+        return [{"type": "text", "content": f"Could not read file: {str(e)}"}]
+
+
+# Kept for backward compatibility with any other code that expects flat text
+def extract_text_from_file(file):
+    blocks = extract_blocks_from_file(file)
+    return "\n\n".join(b["content"] for b in blocks).strip()
 
 
 # ── CHUNKING ─────────────────────────────────────────────────
 
-def is_table_row(line):
-    """Detects lines that look like table rows (e.g. '1  101  LIFE INSURANCE  ANIN')"""
-    if not line:
-        return False
-    parts = line.split()
-    if len(parts) >= 4 and any(p.isdigit() for p in parts[:2]):
-        return True
-    return False
-
-
 def chunk_text(text, chunk_size=1000, overlap=100):
-    """
-    Smart chunker that:
-    - Keeps entire tables as one chunk (prevents splitting structured data)
-    - Chunks normal text by word count with overlap
-    """
-    lines = text.split("\n")
+    """Word-count chunking with overlap — used only for 'text' type blocks."""
+    words = text.split()
     chunks = []
-    current_chunk = []
-    current_size = 0
-    i = 0
+    start = 0
+    while start < len(words):
+        end = start + chunk_size
+        chunk = " ".join(words[start:end])
+        chunks.append(chunk)
+        start += chunk_size - overlap
+    return chunks
 
-    while i < len(lines):
-        line = lines[i].strip()
 
-        # Detect start of a table and collect entire table as one chunk
-        if is_table_row(line):
-            table_lines = []
-            while i < len(lines) and (is_table_row(lines[i].strip()) or lines[i].strip() == ""):
-                table_lines.append(lines[i])
-                i += 1
-            table_chunk = "\n".join(table_lines).strip()
-            if table_chunk:
-                # Save any accumulated content before the table
-                if current_chunk:
-                    chunks.append("\n".join(current_chunk).strip())
-                    current_chunk = []
-                    current_size = 0
-                chunks.append(table_chunk)
-            continue
-
-        # Normal line — add to current chunk
-        word_count = len(line.split())
-        if current_size + word_count > chunk_size and current_chunk:
-            chunks.append("\n".join(current_chunk).strip())
-            # Keep last few lines for overlap context
-            overlap_lines = current_chunk[-3:]
-            current_chunk = overlap_lines
-            current_size = sum(len(l.split()) for l in overlap_lines)
-
-        current_chunk.append(line)
-        current_size += word_count
-        i += 1
-
-    if current_chunk:
-        chunks.append("\n".join(current_chunk).strip())
-
-    return [c for c in chunks if c]
+def chunk_blocks(blocks, chunk_size=1000, overlap=100, max_table_chars=6000):
+    """
+    Turns extraction blocks into final chunks:
+    - table blocks are kept whole (one chunk), even if they span pages,
+      UNLESS they exceed max_table_chars — then split by row groups to stay safe.
+    - text blocks go through normal word-count chunking with overlap.
+    """
+    chunks = []
+    for block in blocks:
+        if block["type"] == "table":
+            content = block["content"]
+            if len(content) <= max_table_chars:
+                chunks.append(content)
+            else:
+                # Very large table — split by rows, not mid-row, to stay safe on token limits
+                rows = content.split("\n")
+                current, size = [], 0
+                for row in rows:
+                    if size + len(row) > max_table_chars and current:
+                        chunks.append("\n".join(current))
+                        current, size = [], 0
+                    current.append(row)
+                    size += len(row)
+                if current:
+                    chunks.append("\n".join(current))
+        else:
+            chunks.extend(chunk_text(block["content"], chunk_size, overlap))
+    return chunks
 
 
 # ── ROUTES ───────────────────────────────────────────────────
@@ -206,11 +280,11 @@ def upload():
 
     for file in files:
         filename = file.filename
-        text     = extract_text_from_file(file)
-        if not text:
+        blocks   = extract_blocks_from_file(file)
+        if not blocks:
             continue
 
-        chunks  = chunk_text(text, chunk_size=1000, overlap=100)
+        chunks  = chunk_blocks(blocks, chunk_size=1000, overlap=100)
         records = []
 
         for chunk in chunks:
